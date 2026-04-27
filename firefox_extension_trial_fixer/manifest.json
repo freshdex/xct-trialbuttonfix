@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Xbox Store Button Injector",
+  "version": "1.3",
+  "description": "Injects a GET Free Trial button on Xbox Store product pages.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "xbox-store-button-injector@xct.live",
+      "strict_min_version": "115.0"
+    }
+  },
+  "permissions": [
+    "webRequest",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://emerald.xboxservices.com/*",
+    "https://*.xboxlive.com/*",
+    "https://www.xbox.com/*",
+    "https://www.microsoft.com/*",
+    "https://displaycatalog.mp.microsoft.com/*"
+  ],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.xbox.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
