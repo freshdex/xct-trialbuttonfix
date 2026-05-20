@@ -1,10 +1,10 @@
 // Background event page (Firefox MV3)
-// 1. Captures XBL3.0 auth tokens from emerald requests
-// 2. Queries productActions + productDetails APIs to find hidden trials
-
 // Firefox exposes the WebExtensions API on `browser`; `chrome` is also
 // available as a callback-style alias, so we keep using it for parity with
 // the Chrome build.
+//
+// 1. Captures XBL3.0 auth tokens from emerald requests
+// 2. Queries productActions + productDetails APIs to find hidden trials
 
 chrome.webRequest.onSendHeaders.addListener(
   (details) => {
@@ -59,159 +59,77 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
 
       try {
-        // Step 1: Check productActions for Trial action or SKU 0011
+        // Step 1: Check productActions for explicit Trial action.
+        // This is visible for non-Game-Pass users; for Game Pass users on
+        // affected SKUs Microsoft hides the Trial action — that's the bug
+        // this extension exists to work around.
         const actionsResp = await fetch(
           `https://emerald.xboxservices.com/xboxcomfd/productActions/${productId}?locale=en-US`,
           { headers: makeHeaders(result.xblToken) }
         );
 
-        if (!actionsResp.ok) {
-          const errBody = await actionsResp.text().catch(() => "");
-          sendResponse({ error: `productActions ${actionsResp.status}: ${errBody.substring(0, 200)}` });
-          return;
-        }
-
-        const actionsData = await actionsResp.json();
-        console.log("[XBOX-INJ-BG] productActions for", productId);
-
-        let trialInfo = null;
-        let hasTrialSku = false;
-
-        if (actionsData.productActions && actionsData.productActions.length > 0) {
-          const pa = actionsData.productActions[0];
-
-          // Check for explicit Trial action (visible for non-Game Pass users)
-          if (pa.productActions) {
+        if (actionsResp.ok) {
+          const actionsData = await actionsResp.json();
+          const pa = actionsData.productActions && actionsData.productActions[0];
+          if (pa && pa.productActions) {
             for (const action of pa.productActions) {
               if (action.actionType === "Trial" && action.actionArguments) {
-                trialInfo = {
+                const trialInfo = {
                   productId: action.actionArguments.ProductId || productId,
                   skuId: action.actionArguments.SkuId,
                   availabilityId: action.actionArguments.AvailabilityId
                 };
-                break;
+                console.log("[XBOX-INJ-BG] Trial found via productActions:", JSON.stringify(trialInfo));
+                sendResponse({ trialInfo });
+                return;
               }
             }
           }
-
-          // Check if SKU 0011 exists (trial SKU hidden by Game Pass)
-          if (!trialInfo && pa.skuActionsBySkuId && pa.skuActionsBySkuId["0011"]) {
-            hasTrialSku = true;
-            console.log("[XBOX-INJ-BG] SKU 0011 found but Trial action hidden (Game Pass bug)");
-          }
         }
 
-        // If we found an explicit trial, return it
-        if (trialInfo) {
-          console.log("[XBOX-INJ-BG] Trial found via productActions:", JSON.stringify(trialInfo));
-          sendResponse({ trialInfo });
-          return;
-        }
+        // Step 2: No explicit Trial action — either no trial exists OR it's
+        // hidden by the Game Pass bug. Resolve via displaycatalog by looking
+        // for ANY SKU with IsTrial=true. The trial SKU id varies per product
+        // (Dead Island 2 uses "0004", many others use "0011", etc.) so we
+        // can't hardcode it.
+        console.log("[XBOX-INJ-BG] No explicit Trial action — checking displaycatalog for hidden trial SKU");
+        const catResp = await fetch(
+          `https://displaycatalog.mp.microsoft.com/v7.0/products?bigIds=${productId}&market=US&languages=en-US&fieldsTemplate=details`,
+          { headers: { "Accept": "application/json" } }
+        );
 
-        // If no SKU 0011, no trial exists
-        if (!hasTrialSku) {
-          console.log("[XBOX-INJ-BG] No trial SKU (0011) for this game");
+        if (!catResp.ok) {
+          console.log("[XBOX-INJ-BG] displaycatalog failed:", catResp.status);
           sendResponse({ trialInfo: null });
           return;
         }
 
-        // Step 2: SKU 0011 exists but Trial action is hidden.
-        // Get the availability ID from productDetails.
-        console.log("[XBOX-INJ-BG] Fetching productDetails for availability ID...");
-
-        // productDetails uses api-version 2.0
-        const detailHeaders = makeHeaders(result.xblToken);
-        detailHeaders["x-ms-api-version"] = "2.0";
-
-        const detailsResp = await fetch(
-          `https://emerald.xboxservices.com/xboxcomfd/productDetails/${productId}?locale=en-US&enableFullDetail=true&deviceType=desktop`,
-          { headers: detailHeaders }
-        );
-
-        if (!detailsResp.ok) {
-          const errBody = await detailsResp.text().catch(() => "");
-          console.error("[XBOX-INJ-BG] productDetails", detailsResp.status, ":", errBody.substring(0, 500));
-
-          // Try the display catalog API as fallback
-          console.log("[XBOX-INJ-BG] Trying displaycatalog fallback...");
-          const catResp = await fetch(
-            `https://displaycatalog.mp.microsoft.com/v7.0/products?bigIds=${productId}&market=US&languages=en-US`,
-            { headers: { "Accept": "application/json" } }
-          );
-
-          if (catResp.ok) {
-            const catData = await catResp.json();
-            const catStr = JSON.stringify(catData);
-            // Find availability for SKU 0011
-            const match = catStr.match(/"SkuId"\s*:\s*"0011"[\s\S]*?"AvailabilityId"\s*:\s*"([^"]+)"/i);
-            if (match) {
-              console.log("[XBOX-INJ-BG] Found availability via catalog:", match[1]);
-              sendResponse({ trialInfo: { productId, skuId: "0011", availabilityId: match[1] } });
-              return;
-            }
-          }
-
-          // Last resort fallback
-          console.log("[XBOX-INJ-BG] All APIs failed, cannot get availability ID");
-          sendResponse({ trialInfo: { productId, skuId: "0011", availabilityId: "" } });
+        const catData = await catResp.json();
+        const product = catData.Products && catData.Products[0];
+        if (!product) {
+          console.log("[XBOX-INJ-BG] No product in catalog response");
+          sendResponse({ trialInfo: null });
           return;
         }
 
-        const detailsData = await detailsResp.json();
-
-        // Search for SKU 0011's availability ID in the product details
-        let availabilityId = "";
-        try {
-          const detailsStr = JSON.stringify(detailsData);
-
-          // Look for SKU 0011 availability patterns
-          if (detailsData.skus) {
-            for (const sku of detailsData.skus) {
-              if (sku.skuId === "0011" && sku.availabilities && sku.availabilities.length > 0) {
-                availabilityId = sku.availabilities[0].availabilityId;
-                break;
-              }
+        const dsas = product.DisplaySkuAvailabilities || [];
+        for (const dsa of dsas) {
+          const sku = dsa.Sku || {};
+          const props = sku.Properties || {};
+          if (props.IsTrial === true) {
+            const skuId = sku.SkuId;
+            const availabilityId =
+              (dsa.Availabilities && dsa.Availabilities[0] && dsa.Availabilities[0].AvailabilityId) || "";
+            if (skuId && availabilityId) {
+              console.log(`[XBOX-INJ-BG] Trial SKU ${skuId} found via catalog, avail ${availabilityId}`);
+              sendResponse({ trialInfo: { productId, skuId, availabilityId } });
+              return;
             }
           }
-
-          // Also try nested product.skus structure
-          if (!availabilityId && detailsData.products) {
-            for (const prod of detailsData.products) {
-              if (prod.skus) {
-                for (const sku of prod.skus) {
-                  if (sku.skuId === "0011" && sku.availabilities && sku.availabilities.length > 0) {
-                    availabilityId = sku.availabilities[0].availabilityId;
-                    break;
-                  }
-                }
-              }
-              if (availabilityId) break;
-            }
-          }
-
-          // Regex fallback: find 0011 near an availability ID
-          if (!availabilityId) {
-            const match = detailsStr.match(/"skuId"\s*:\s*"0011"[^}]*?"availabilityId"\s*:\s*"([^"]+)"/);
-            if (match) availabilityId = match[1];
-          }
-          if (!availabilityId) {
-            // Try reversed order
-            const match2 = detailsStr.match(/"availabilityId"\s*:\s*"([^"]+)"[^}]*?"skuId"\s*:\s*"0011"/);
-            if (match2) availabilityId = match2[1];
-          }
-        } catch (e) {
-          console.error("[XBOX-INJ-BG] Error parsing details:", e);
         }
 
-        console.log("[XBOX-INJ-BG] Trial SKU 0011 availability:", availabilityId || "(not found, will try empty)");
-
-        sendResponse({
-          trialInfo: {
-            productId: productId,
-            skuId: "0011",
-            availabilityId: availabilityId
-          }
-        });
+        console.log("[XBOX-INJ-BG] No trial SKU found in catalog for", productId);
+        sendResponse({ trialInfo: null });
 
       } catch (e) {
         console.error("[XBOX-INJ-BG] Error:", e);
