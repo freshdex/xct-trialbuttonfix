@@ -40,6 +40,57 @@ function makeHeaders(token) {
   };
 }
 
+// In-memory cache of resolved trialInfo, keyed by productId. Survives within
+// the service-worker lifetime; second nav to the same product is instant.
+// `null` is cached too so we don't re-probe games that have no trial.
+const _trialCache = new Map();
+
+async function _probeProductActions(token, productId) {
+  const r = await fetch(
+    `https://emerald.xboxservices.com/xboxcomfd/productActions/${productId}?locale=en-US`,
+    { headers: makeHeaders(token) }
+  );
+  if (!r.ok) throw new Error("productActions HTTP " + r.status);
+  const data = await r.json();
+  const pa = data.productActions && data.productActions[0];
+  if (!pa || !pa.productActions) throw new Error("no productActions array");
+  for (const action of pa.productActions) {
+    if (action.actionType === "Trial" && action.actionArguments) {
+      return {
+        productId: action.actionArguments.ProductId || productId,
+        skuId: action.actionArguments.SkuId,
+        availabilityId: action.actionArguments.AvailabilityId,
+        source: "productActions"
+      };
+    }
+  }
+  throw new Error("no Trial action");
+}
+
+async function _probeDisplayCatalog(productId) {
+  const r = await fetch(
+    `https://displaycatalog.mp.microsoft.com/v7.0/products?bigIds=${productId}&market=US&languages=en-US&fieldsTemplate=details`,
+    { headers: { "Accept": "application/json" } }
+  );
+  if (!r.ok) throw new Error("displaycatalog HTTP " + r.status);
+  const data = await r.json();
+  const product = data.Products && data.Products[0];
+  if (!product) throw new Error("no product in catalog response");
+  for (const dsa of (product.DisplaySkuAvailabilities || [])) {
+    const sku = dsa.Sku || {};
+    const props = sku.Properties || {};
+    if (props.IsTrial === true) {
+      const skuId = sku.SkuId;
+      const availabilityId =
+        (dsa.Availabilities && dsa.Availabilities[0] && dsa.Availabilities[0].AvailabilityId) || "";
+      if (skuId && availabilityId) {
+        return { productId, skuId, availabilityId, source: "displaycatalog" };
+      }
+    }
+  }
+  throw new Error("no IsTrial SKU");
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "getToken") {
     chrome.storage.local.get(["xblToken", "tokenTime"], (result) => sendResponse(result));
@@ -48,88 +99,43 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === "checkTrial") {
     const productId = msg.productId;
+
+    // Cached? Respond synchronously.
+    if (_trialCache.has(productId)) {
+      const cached = _trialCache.get(productId);
+      console.log("[XBOX-INJ-BG] Cache hit for", productId, "→", cached ? "trial" : "no-trial");
+      sendResponse({ trialInfo: cached });
+      return true;
+    }
+
     chrome.storage.local.get(["xblToken"], async (result) => {
       if (!result.xblToken) {
         sendResponse({ error: "No auth token available" });
         return;
       }
 
+      // Race the two probes — productActions usually wins for non-hidden
+      // trials; displaycatalog is the fallback for Game-Pass-hidden trials.
+      // Promise.any() resolves on the first SUCCESSFUL probe, so we no longer
+      // wait for productActions to fail before starting the catalog lookup.
       try {
-        // Step 1: Check productActions for explicit Trial action.
-        // This is visible for non-Game-Pass users; for Game Pass users on
-        // affected SKUs Microsoft hides the Trial action — that's the bug
-        // this extension exists to work around.
-        const actionsResp = await fetch(
-          `https://emerald.xboxservices.com/xboxcomfd/productActions/${productId}?locale=en-US`,
-          { headers: makeHeaders(result.xblToken) }
-        );
-
-        if (actionsResp.ok) {
-          const actionsData = await actionsResp.json();
-          const pa = actionsData.productActions && actionsData.productActions[0];
-          if (pa && pa.productActions) {
-            for (const action of pa.productActions) {
-              if (action.actionType === "Trial" && action.actionArguments) {
-                const trialInfo = {
-                  productId: action.actionArguments.ProductId || productId,
-                  skuId: action.actionArguments.SkuId,
-                  availabilityId: action.actionArguments.AvailabilityId
-                };
-                console.log("[XBOX-INJ-BG] Trial found via productActions:", JSON.stringify(trialInfo));
-                sendResponse({ trialInfo });
-                return;
-              }
-            }
-          }
-        }
-
-        // Step 2: No explicit Trial action — either no trial exists OR it's
-        // hidden by the Game Pass bug. Resolve via displaycatalog by looking
-        // for ANY SKU with IsTrial=true. The trial SKU id varies per product
-        // (Dead Island 2 uses "0004", many others use "0011", etc.) so we
-        // can't hardcode it.
-        console.log("[XBOX-INJ-BG] No explicit Trial action — checking displaycatalog for hidden trial SKU");
-        const catResp = await fetch(
-          `https://displaycatalog.mp.microsoft.com/v7.0/products?bigIds=${productId}&market=US&languages=en-US&fieldsTemplate=details`,
-          { headers: { "Accept": "application/json" } }
-        );
-
-        if (!catResp.ok) {
-          console.log("[XBOX-INJ-BG] displaycatalog failed:", catResp.status);
-          sendResponse({ trialInfo: null });
-          return;
-        }
-
-        const catData = await catResp.json();
-        const product = catData.Products && catData.Products[0];
-        if (!product) {
-          console.log("[XBOX-INJ-BG] No product in catalog response");
-          sendResponse({ trialInfo: null });
-          return;
-        }
-
-        const dsas = product.DisplaySkuAvailabilities || [];
-        for (const dsa of dsas) {
-          const sku = dsa.Sku || {};
-          const props = sku.Properties || {};
-          if (props.IsTrial === true) {
-            const skuId = sku.SkuId;
-            const availabilityId =
-              (dsa.Availabilities && dsa.Availabilities[0] && dsa.Availabilities[0].AvailabilityId) || "";
-            if (skuId && availabilityId) {
-              console.log(`[XBOX-INJ-BG] Trial SKU ${skuId} found via catalog, avail ${availabilityId}`);
-              sendResponse({ trialInfo: { productId, skuId, availabilityId } });
-              return;
-            }
-          }
-        }
-
-        console.log("[XBOX-INJ-BG] No trial SKU found in catalog for", productId);
-        sendResponse({ trialInfo: null });
-
+        const trialInfo = await Promise.any([
+          _probeProductActions(result.xblToken, productId),
+          _probeDisplayCatalog(productId)
+        ]);
+        console.log(`[XBOX-INJ-BG] Trial found via ${trialInfo.source}:`,
+                    JSON.stringify({ productId: trialInfo.productId,
+                                     skuId: trialInfo.skuId,
+                                     availabilityId: trialInfo.availabilityId }));
+        _trialCache.set(productId, trialInfo);
+        sendResponse({ trialInfo });
       } catch (e) {
-        console.error("[XBOX-INJ-BG] Error:", e);
-        sendResponse({ error: e.message });
+        // AggregateError from Promise.any when both probes fail. The user
+        // has no trial available for this product.
+        const reasons = (e && e.errors) ? e.errors.map(x => x.message).join("; ") : String(e);
+        console.log("[XBOX-INJ-BG] No trial for", productId, "—", reasons);
+        _trialCache.set(productId, null);
+        sendResponse({ trialInfo: null });
       }
     });
     return true;
