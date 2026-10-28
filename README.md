@@ -30,6 +30,17 @@ This extension detects those cases and injects a working **GET Free Trial** butt
 
 The extension is purely a UI fix — it does not bypass DRM, region locks, age gates, or payment. It only un-hides an action that the back-end already permits.
 
+## XBOX Playback, before Microsoft opens it (Chrome build, v1.6)
+
+[xbox.com/playback](https://www.xbox.com/playback) is Microsoft's look back at your XBOX years for the 25th anniversary. The page is finished, but Microsoft keeps it behind a feature gate (`EnablePlaybackPage`), so for now xbox.com answers 404 and Microsoft's Playback service answers `notReadyYet`.
+
+`playback.js` opens that gate in your own browser. xbox.com reads its feature gates from `window.__PRELOADED_STATE__.experiments` (environment gates, experiment gates and `overrideFeatureGates`, merged in that order). The script runs in the page's own world at `document_start` and adds `enableplaybackpage` and `enableplaybackcardsharepage` to `overrideFeatureGates` as the page writes that state. Then:
+
+- xbox.com's own router opens `/playback` instead of a 404,
+- xbox.com's own client sends the gates to Microsoft in the `xbl-experiments` header, and the Playback service answers with your real archive.
+
+Sign in on xbox.com, then open **https://www.xbox.com/playback**. Nothing else on xbox.com is changed, nothing is sent anywhere else, and the page you see is Microsoft's own. Needs Chrome / Edge 111 or later (content scripts in the page's world).
+
 ## Files
 
 ```
@@ -37,6 +48,7 @@ chrome_extension_trial_fixer/        # Chrome / Edge / Brave (MV3)
   manifest.json
   background.js                      # service_worker
   content.js
+  playback.js                        # opens the XBOX Playback gate (page world, document_start)
 
 firefox_extension_trial_fixer/       # Firefox (MV3)
   manifest.json                      # uses background.scripts + browser_specific_settings.gecko
